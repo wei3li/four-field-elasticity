@@ -17,11 +17,11 @@ const _R3d = VectorValue([0., 0., 1.])
 
 function _PROJECT_DIR()
   curdir = pwd()
-  stopidx = findfirst("HyperelasticityPaper", curdir).stop
+  stopidx = findfirst("four-field-elasticity", curdir).stop
   curdir[1:stopidx]
 end
 
-const DATA_DIR = joinpath(_PROJECT_DIR(), "notebooks/data")
+const DATA_DIR = joinpath(_PROJECT_DIR(), "data")
 const MESH_DIR = joinpath(_PROJECT_DIR(), "meshes")
 
 vectors_to_tensor(v1, v2) = v1 ⊗ _L2d + v2 ⊗ _R2d

@@ -1,0 +1,182 @@
+using Gridap, LineSearches
+import GridapGmsh: GmshDiscreteModel
+import Unicode: graphemes
+
+include("utilities.jl")
+
+
+λ, μ = [1.1], 1.0
+
+Ū((x, y)) = VectorValue(x < 0.5 ? 0.0 : λ[1], 0.0)
+
+filename = joinpath(DATA_DIR, "stretch2d_record.csv")
+create_file_with_header(filename,
+  "comb,meshtype,meshidx,ncell,h,Udof,Kdof,Pdof,pdof,xdof,",
+  "u,Ul2norm,Kl2norm,Pl2norm,Phdivnorm,pl2norm")
+
+
+function run_stretch2d_option2(reffe_names, meshname)
+  chars = collect(graphemes(reffe_names))
+  ords = [parse(Int, c) for c in chars if all(isdigit, c)]
+  typs = [c for c in chars if !any(isdigit, c)]
+
+  simpl = 'P' ∈ typs[1]
+  change_type(typ) = ('P' ∈ typ || 'Q' ∈ typ) ? (simpl ? "Q" : typ) : typ
+  rfu = symbol_to_space[change_type(typs[1])]
+  reffe_U = ('P' ∈ typs[1] || 'Q' ∈ typs[1]) ? rfu(VectorValue{2,Float64}, ords[1]) : rfu(ords[1])
+  rff = symbol_to_space[change_type(typs[2])]
+  reffe_K = ('P' ∈ typs[2] || 'Q' ∈ typs[2]) ? rff(VectorValue{2,Float64}, ords[2]) : rff(ords[2])
+  reffe_P = symbol_to_space[change_type(typs[3])](ords[3])
+  reffe_p = symbol_to_space[change_type(typs[4])](Float64, ords[4])
+
+  model = GmshDiscreteModel(joinpath(MESH_DIR, "stretch2d/stretch2d_$(meshname).msh"))
+
+  tag_to_name = get_face_labeling(model).tag_to_name
+  neum_tags = filter(s -> startswith(s, "neum"), tag_to_name)
+  confs = [symbol_to_conformity[typs[i]] for i in 1:4]
+  L2U = FESpace(model, reffe_U, conformity=confs[1])
+  L2K = FESpace(model, reffe_K, conformity=confs[2])
+  DvP = TestFESpace(model, reffe_P, conformity=confs[3], dirichlet_tags=neum_tags)
+  L2p = FESpace(model, reffe_p, conformity=confs[4])
+  Y = MultiFieldFESpace([L2U, L2K, L2K, DvP, DvP, L2p])
+  X = Y
+
+  qdeg = 2max(maximum(ords), 1) + 1
+  Ω = Triangulation(model)
+  dΩ, dΩ⁺ = Measure(Ω, qdeg), Measure(Ω, 2qdeg)
+
+  diri_tags = filter(s -> startswith(s, "diri"), tag_to_name)
+  Γ = BoundaryTriangulation(Ω, tags=diri_tags)
+  dΓ = Measure(Γ, qdeg)
+  N = get_normal_vector(Γ)
+
+  function a((U, K1, K2, P1, P2, p), (V, κ1, κ2, ψ1, ψ2, q))
+    K, P = vectors_to_tensor(K1, K2), vectors_to_tensor(P1, P2)
+    κ, ψ = vectors_to_tensor(κ1, κ2), vectors_to_tensor(ψ1, ψ2)
+    divP = scalars_to_vector(∇ ⋅ P1, ∇ ⋅ P2)
+    divψ = scalars_to_vector(∇ ⋅ ψ1, ∇ ⋅ ψ2)
+
+    F = K + I2
+    J = det(F)
+    pQ = p * J * inv(F)'
+
+    ∫(V ⋅ divP -
+      κ ⊙ (μ * F + pQ - P) +
+      ψ ⊙ K + divψ ⋅ U -
+      q * (J - 1))dΩ
+
+  end
+
+  function l((V, κ1, κ2, ψ1, ψ2, q))
+    ψ = vectors_to_tensor(ψ1, ψ2)
+    ∫(N ⋅ ψ ⋅ Ū)dΓ
+  end
+
+  function j((U, K1, K2, P1, P2, p), (dU, dK1, dK2, dP1, dP2, dp), (V, κ1, κ2, ψ1, ψ2, q))
+    K = vectors_to_tensor(K1, K2)
+    dK, dP = vectors_to_tensor(dK1, dK2), vectors_to_tensor(dP1, dP2)
+    κ, ψ = vectors_to_tensor(κ1, κ2), vectors_to_tensor(ψ1, ψ2)
+    divdP = scalars_to_vector(∇ ⋅ dP1, ∇ ⋅ dP2)
+    divψ = scalars_to_vector(∇ ⋅ ψ1, ∇ ⋅ ψ2)
+
+    F = K + I2
+    iF = inv(F)
+    iFdK = iF ⋅ dK
+    J = det(F)
+    JiFdK = J * tr(iFdK)
+
+    ∫(V ⊙ divdP -
+      κ ⊙ (μ * dK + p * (JiFdK * iF' - J * (iFdK ⋅ iF)') + dp * J * iF' - dP) +
+      ψ ⊙ dK + divψ ⋅ dU -
+      q * JiFdK)dΩ
+  end
+
+  r(x, y) = a(x, y) - l(y)
+
+  Udof, Kdof = num_free_dofs(L2U), 2num_free_dofs(L2K)
+  Pdof, pdof = 2num_free_dofs(DvP), num_free_dofs(L2p)
+  xdof = num_free_dofs(Y)
+  meshtype = meshname[1:findlast("_", meshname).start-1]
+  meshidx = meshname[findlast("_", meshname).start+1:end]
+  max_cell_area = maximum((∫(1)Measure(Ω, 2))[Ω])
+  h = sqrt(max_cell_area)
+  simpl && (h = sqrt(4 * max_cell_area / sqrt(3)))
+  ncells = num_cells(model)
+
+  function correct_displacement(Kh)
+    reffe_U1 = ReferenceFE(lagrangian, VectorValue{2,Float64}, ords[2] + 1)
+    H10 = FESpace(model, reffe_U1, dirichlet_tags=diri_tags)
+    H1U = TrialFESpace(H10, Ū)
+    au(UU, UV) = ∫(∇(UV) ⊙ ∇(UU))dΩ
+    lu(UV) = ∫(∇(UV) ⊙ Kh)dΩ
+    solve(AffineFEOperator(au, lu, H1U, H10))
+  end
+
+  function record_norms(λ, xh, dΩ)
+    Uh, Kh1, Kh2, Ph1, Ph2, ph = xh
+    Kh, Ph = vectors_to_tensor(Kh1, Kh2), vectors_to_tensor(Ph1, Ph2)
+    ∇Ph = scalars_to_vector(∇ ⋅ Ph1, ∇ ⋅ Ph2)
+    Ul2norm, Kl2norm = compute_l2_norm(Uh, dΩ), compute_l2_norm(Kh, dΩ)
+    Pl2norm, pl2norm = compute_l2_norm(Ph, dΩ), compute_l2_norm(ph, dΩ)
+    Phdivnorm = √(Pl2norm^2 + compute_l2_norm(∇Ph, dΩ)^2)
+
+    write_line(filename,
+      "$reffe_names,$meshtype,$meshidx,$ncells,$h,$Udof,$Kdof,$Pdof,$pdof,$xdof,",
+      "$λ,$Ul2norm,$Kl2norm,$Pl2norm,$Phdivnorm,$pl2norm")
+
+    Uh1 = correct_displacement(Kh)
+    Udof1 = length(Uh1.free_values)
+    xdof1 = Udof1 + Kdof + Pdof + pdof
+    Ul2norm1 = compute_l2_norm(Uh1, dΩ⁺)
+    write_line(filename,
+      "$(reffe_names)(corr),$meshtype,$meshidx,$ncells,$h,$Udof1,$Kdof,$Pdof,$pdof,$xdof1,",
+      "$λ,$Ul2norm1,$Kl2norm,$Pl2norm,$Phdivnorm,$pl2norm")
+
+    fields = [
+      "displacement" => Uh, "corrected displacement" => Uh1,
+      "strain" => Kh, "stress" => Ph, "div stress" => ∇Ph,
+      "pressure" => ph, "Jacobian (u = $λ)" => det(Kh + I2)
+    ]
+    writevtk(Ω, joinpath(DATA_DIR, "stretch2d_$(reffe_names)_results"), cellfields=fields)
+  end
+
+  ftol = 1e-9
+  nls = NLSolver(show_trace=true, method=:newton, linesearch=HagerZhang(), ftol=ftol, iterations=60)
+  solver = FESolver(nls)
+  cache = nothing
+  xh = zero(X)
+
+  println("\n[$reffe_names] $ncells cells optimisation begins...")
+  for λi in [0:0.1:0.5..., 0.55:0.05:1.5...]
+    λ[1] = λi
+    xh = FEFunction(X, get_free_dof_values(xh))
+    op = FEOperator(r, j, X, Y)
+    println("λ = $λi optimisation starting...\n")
+    xh, cache = solve!(xh, solver, op, cache)
+
+    rmax = norm(assemble_vector(y -> r(xh, y), Y), Inf)
+    if rmax > ftol
+      println("λ = $λi optimisation did not converge, inf norm of residual: $rmax.")
+      println_now("..................................\n")
+      continue
+    end
+
+    λi in 0.5:0.5:2.0 && record_norms(λi, xh, dΩ⁺)
+    println_now("λ = $λi optimisation finished\n..................................\n")
+  end
+end
+
+mtype = "delaunay"
+pairs = ["P̄0d1d1P1", "P̄1d2d2P2"]
+pair_to_mindices = Dict(
+  pairs[1] => [80, 66, 53, 43, 35, 29],
+  pairs[2] => [78, 60, 48, 39, 31])
+
+pair = pairs[parse(Int, ARGS[1])]
+for midx in pair_to_mindices[pair]
+  try
+    run_stretch2d_option2(pair, "$(mtype)_$midx")
+  catch e
+    println_now("[$pair, $mtype size $midx] failed: $e")
+  end
+end
